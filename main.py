@@ -1,6 +1,7 @@
 import csv
 import socket
 import select
+import operator
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -22,76 +23,12 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.model_selection import train_test_split
 
 
-# Socket buffer size
-socket_buffer_size = 128 * 1024
-
-# List of active socks
-socks = []
-
-# Packet structure
-packet = Array(10, Float32n)
-
-# Boards configuration
-boards = [
-    {'id': 0, 'ip': '172.20.10.9', 'port': 8887},
-    {'id': 1, 'ip': '172.20.10.9', 'port': 8888},
-    {'id': 2, 'ip': '172.20.10.9', 'port': 8889},
-]
-
-# Boards lookup table
-boards_lookup_table = {
-    '172.20.10.9:8887': 0,
-    '172.20.10.9:8888': 1,
-    '172.20.10.9:8889': 2,
-}
-
-# Boards buckets
-boards_buckets = {}
-
-# ML Model
-ml_model = None
-
-
-# Retrieves socket packets - non blocking
-def packets(_sock):
-    while True:
-        # noinspection PyBroadException
-        try:
-            yield _sock.recvfrom(socket_buffer_size)
-        except Exception:
-            return
-
-
-# Initialize sockets for all boards
-def init_socks():
-    for board in boards:
-        _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        _sock.bind((board['ip'], board['port']))
-        _sock.setblocking(0)
-        socks.append(_sock)
-
-
-# UDP Listen to all boards
-def listen():
-    while True:
-        for _sock, _, _ in select.select(socks, [], []):
-            for data, address in packets(_sock):
-                boards_buckets[address].append(packet.parse(data))
-                # Make sure to clean boards buckets as of fast growth
-
-
-# Init boards buckets
-def init_buckets():
-    for board in boards_lookup_table.keys():
-        boards_buckets[board] = []
-
-
 # Data set structure
 class DataSet:
     def __init__(self, fname):
         self.data = None
         self.target = None
+        self.fname = fname
         self.load_data(fname)
 
     def load_data(self, fname):
@@ -104,35 +41,100 @@ class DataSet:
         self.data = np.array(data).astype(float)
         self.target = np.array(target).astype(int)
 
-    def min(self, axis):
-        # Returns min value for a given axis
-        return self.data[:, axis].min()
 
-    def max(self, axis):
-        # Returns max value for a given axis
-        return self.data[:, axis].max()
+# Sample structure
+class Sample:
+    def __init__(self, payload):
+        self.payload = np.array(packet.parse(payload))
+        self.mean = self.payload.mean()
+        self.std_deviation = self.payload.std()
+        self.zero_cross_rate = self.zcr()
 
-    def mean(self, axis):
-        # Returns max value for a given axis
-        return self.data[:, axis].mean()
+    def data(self):
+        # List representation of sample
+        return [self.mean, self.std_deviation, self.zero_cross_rate]
+
+    def zcr(self):
+        # Zero-crossing rate
+        return sum([(self.payload[j] - self.mean) * (self.payload[j-1] - self.mean) for j, _ in enumerate(self.payload)])
 
 
-def init_ml_model(data):
-    global ml_model
-    ml_model = MiniBatchKMeans(init='k-means++', n_clusters=3, batch_size=3, n_init=10,
-                               max_no_improvement=10, verbose=0, random_state=0).fit(data.data, data.target)
+# Board repr.
+class Board:
+    def __init__(self, ip, port, board_ip, data_set):
+
+        self.ip = ip
+        self.port = port
+        self.board_ip = board_ip
+
+        self.data_set = DataSet(data_set)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.ip, self.port))
+
+        self.ml_model = MiniBatchKMeans(init='k-means++', n_clusters=3, batch_size=3, n_init=10,
+                                        max_no_improvement=10, verbose=0, random_state=0)
+        self.ml_model.fit(self.data_set.data, self.data_set.target)
+
+        self.stream_payload = None
+
+    def predict(self):
+        return self.ml_model.predict(np.array([self.stream_payload, ]))
+
+
+# Test mode flag
+__test__ = False
+
+# Socket buffer size
+socket_buffer_size = 128 * 1024
+
+# Packet structure
+packet = Array(10, Float32n)
+
+# Boards configuration
+boards = [
+    Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.108', data_set='data/board_0.data'),
+    # Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.109', data_set='data/board_0.data'),
+    # Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.110', data_set='data/board_0.data'),
+]
+
+# boards lookup table
+boards_lookup_table = {}
+
+# Activity predictions for each board
+predictions = {}
+
+# Activities
+activities = {
+    0: 'standby',
+    1: 'walk',
+    3: 'run'
+}
+
+
+def run():
+    while True:
+        ready_socks, _, _ = select.select([board.sock for board in boards], [], [])
+        for _sock in ready_socks:
+            stream_data, address = _sock.recvfrom(socket_buffer_size)
+            boards[boards_lookup_table[address]].stream_payload = Sample(stream_data).data()
+
+            if __test__:
+                with open(boards[boards_lookup_table[address]].data_set.fname, 'a') as f:
+                    f.write(boards[boards_lookup_table[address]].stream_payload)
+
+            boards[boards_lookup_table[address]].predict()
 
 
 if __name__ == '__main__':
-    # init_ml_model(DataSet("data/v1.data"))
-    # init_socks()
-    # init_buckets()
-    # listen()
-    pass
+    boards_lookup_table = {(board.board_ip, board.port): index for index, board in enumerate(boards)}
+    run()
+
 
 ###########################################################################################
 
-X = DataSet("data/v1.data")
+X = DataSet("data/board_0.data")
 
 """
 n_clusters : int, optional, default: 8
@@ -190,7 +192,6 @@ color = ["g", "r", "b"]
 
 fig = figure()
 ax = fig.gca(projection='3d')
-
 
 for i in range(X.data.shape[0]):
     ax.scatter(X.data[i][0], X.data[i][1], X.data[i][2], c=color[model.labels_[i]])
