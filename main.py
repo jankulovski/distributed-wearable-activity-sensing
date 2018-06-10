@@ -1,11 +1,8 @@
 import csv
 import socket
 import select
-import operator
 import numpy as np
 import matplotlib.pyplot as plt
-
-from pylab import figure
 
 from construct import Array
 from construct import Float32n
@@ -13,14 +10,10 @@ from construct import Float32n
 # noinspection PyUnresolvedReferences
 from mpl_toolkits.mplot3d import Axes3D
 
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import completeness_score
-from sklearn.metrics import homogeneity_score
+from sklearn.neural_network import MLPClassifier
+import operator
 
-from sklearn.cluster import MiniBatchKMeans
-
-from sklearn.model_selection import train_test_split
+from collections import defaultdict
 
 
 # Data set structure
@@ -48,15 +41,12 @@ class Sample:
         self.payload = np.array(packet.parse(payload))
         self.mean = self.payload.mean()
         self.std_deviation = self.payload.std()
-        self.zero_cross_rate = self.zcr()
+        self.zero_cross_rate = sum([(self.payload[j] - self.mean) * (self.payload[j-1] - self.mean) for j, _ in
+                                    enumerate(self.payload)])
 
     def data(self):
         # List representation of sample
         return [self.mean, self.std_deviation, self.zero_cross_rate]
-
-    def zcr(self):
-        # Zero-crossing rate
-        return sum([(self.payload[j] - self.mean) * (self.payload[j-1] - self.mean) for j, _ in enumerate(self.payload)])
 
 
 # Board repr.
@@ -73,14 +63,15 @@ class Board:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.ip, self.port))
 
-        self.ml_model = MiniBatchKMeans(init='k-means++', n_clusters=3, batch_size=3, n_init=10,
-                                        max_no_improvement=10, verbose=0, random_state=0)
-        self.ml_model.fit(self.data_set.data, self.data_set.target)
+        self.ml_model = MLPClassifier(hidden_layer_sizes=(10, 10, 10), max_iter=1000)
+
+        if not __test__:
+            self.ml_model.fit(self.data_set.data, self.data_set.target)
 
         self.stream_payload = None
 
     def predict(self):
-        return self.ml_model.predict(np.array([self.stream_payload, ]))
+        return self.ml_model.predict_proba(np.array([self.stream_payload, ]))
 
 
 # Test mode flag
@@ -94,9 +85,9 @@ packet = Array(10, Float32n)
 
 # Boards configuration
 boards = [
-    Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.108', data_set='data/board_0.data'),
-    # Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.109', data_set='data/board_0.data'),
-    # Board(ip='192.168.0.103', port=8888, board_ip='192.168.0.110', data_set='data/board_0.data'),
+    Board(ip='192.168.43.152', port=8888, board_ip='192.168.43.25', data_set='data/board_0.data'),  # 21 Left p
+    Board(ip='192.168.43.152', port=8887, board_ip='192.168.43.243', data_set='data/board_1.data'),  # 29 Right p
+    Board(ip='192.168.43.152', port=8886, board_ip='192.168.43.82', data_set='data/board_2.data'),  # 28 Ch
 ]
 
 # boards lookup table
@@ -109,93 +100,175 @@ predictions = {}
 activities = {
     0: 'standby',
     1: 'walk',
-    3: 'run'
+    2: 'run'
 }
+
+# states transitions
+states = {
+    0: 3,
+    1: 4,
+    2: 5,
+    3: {1: 4, 2: 5, 0: 0},
+    4: {1: 1, 2: 5, 0: 3},
+    5: {1: 4, 2: 2, 0: 3},
+}
+
+# keep track of the current state
+current_state = 0
+
+# Plot settings
+plot_means = (0, 0, 0)
+
+plot_ind = np.arange(len(plot_means))
+plot_width = 0.3
+
+fig, ax = plt.subplots()
+rects1 = ax.bar(plot_ind - plot_width/2, plot_means, plot_width, color='SkyBlue', label='Standby')
+rects2 = ax.bar(plot_ind + plot_width/2, plot_means, plot_width, color='IndianRed', label='Walk')
+rects3 = ax.bar(plot_ind + plot_width+(plot_width/2), plot_means, plot_width, color='Green', label='Run')
+
+ax.set_xticks(plot_ind+0.5*plot_width)
+ax.set_xticklabels(('board #21', 'board #29', 'board #28'), fontdict=None, minor=False)
+ax.set_ylim([-2, 2])
+
+ax.set_ylabel('Activity Probabilities')
+ax.set_xlabel('Boards')
+ax.set_title('Sensing')
+ax.legend()
+
+rects = [rects1, rects2, rects3]
+
+
+# vote for the final decision
+def vote_final_decision(_predictions):
+
+    votes = defaultdict(int)
+
+    for board_predictions in _predictions:
+        for prediction in board_predictions:
+            votes[board_predictions[prediction]['predicted_activity']] += 1
+
+    max_votes = max(votes.values())
+    vts = [(key, value) for key, value in votes.items() if value == max_votes]
+    if len(vts) == 1:
+        return vts[0][0]
+    else:
+        max_prob = 0
+        activity_with_max_prob = None
+        for vote in vts:
+            for board_predictions in _predictions:
+                for prediction in board_predictions:
+                    if board_predictions[prediction]['predicted_activity'] == vote[0]:
+                        if board_predictions[prediction]['prediction_probability'] > max_prob:
+                            max_prob = board_predictions[prediction]['prediction_probability']
+                            activity_with_max_prob = board_predictions[prediction]['predicted_activity']
+
+        return activity_with_max_prob
+
+
+# Update plots
+def update_plots(_predictions):
+
+    for board_predictions in _predictions:
+        for board_index in board_predictions:
+
+            index = 0
+
+            for rect in rects:
+                if board_predictions[board_index]['probabilities'].shape[0] <= index:
+                    height = 0
+                else:
+                    height = float(board_predictions[board_index]['probabilities'][index])
+
+                rect[board_index].set_height(height)
+                index += 1
+
+    fig.canvas.draw()
+    plt.pause(0.01)
 
 
 def run():
+
+    global current_state
+
+    # List of temporary boards predictions
+    boards_predictions = []
+
+    reciv_addrs = set()
+
     while True:
+
         ready_socks, _, _ = select.select([board.sock for board in boards], [], [])
+
         for _sock in ready_socks:
+
+            # Read stream packets from socket (non-blocking)
             stream_data, address = _sock.recvfrom(socket_buffer_size)
-            boards[boards_lookup_table[address]].stream_payload = Sample(stream_data).data()
+
+            if address in reciv_addrs:
+                continue
+
+            reciv_addrs.add(address)
+
+            # Parse and collect streamed packets
+            boards[boards_lookup_table[address[0]]].stream_payload = Sample(stream_data).data()
 
             if __test__:
-                with open(boards[boards_lookup_table[address]].data_set.fname, 'a') as f:
-                    f.write(boards[boards_lookup_table[address]].stream_payload)
+                # Store test/train data
+                with open(boards[boards_lookup_table[address[0]]].data_set.fname, 'a') as f:
+                    a = boards[boards_lookup_table[address[0]]].stream_payload
+                    f.write(",".join(map(str, a)) + ", 2\n")
+            else:
+                # Perform model prediction
+                board_predictions = boards[boards_lookup_table[address[0]]].predict()
 
-            boards[boards_lookup_table[address]].predict()
+                # Find the activity with max probability
+                activity_index, activity_probability = max(enumerate(board_predictions[0]), key=operator.itemgetter(1))
+
+                boards_predictions.append({boards_lookup_table[address[0]]: {
+                    'probabilities': board_predictions[0],
+                    'predicted_activity': activity_index,
+                    'prediction_probability': activity_probability
+                }})
+
+        if not __test__:
+
+            if len(reciv_addrs) == len(boards):
+
+                # vote for final decision
+                final_decision_activity = vote_final_decision(boards_predictions)
+
+                if final_decision_activity != current_state:
+
+                    if type(states[current_state]) == dict:
+                        current_state = states[current_state][final_decision_activity]
+                    else:
+                        current_state = states[final_decision_activity]
+
+                if current_state == 0:
+                    txt = "Stationary"
+                elif current_state == 3:
+                    txt = "Weak Stationary"
+                elif current_state == 1:
+                    txt = "Walk"
+                elif current_state == 4:
+                    txt = "Weak Walk"
+                elif current_state == 2:
+                    txt = "Run"
+                elif current_state == 5:
+                    txt = "Weak Run"
+                else:
+                    txt = "Unknown"
+
+                print("Current state: ", txt)
+
+                update_plots(boards_predictions)
+
+                # reset predictions list
+                boards_predictions = []
+                reciv_addrs.clear()
 
 
 if __name__ == '__main__':
-    boards_lookup_table = {(board.board_ip, board.port): index for index, board in enumerate(boards)}
+    boards_lookup_table = {board.board_ip: index for index, board in enumerate(boards)}
     run()
-
-
-###########################################################################################
-
-X = DataSet("data/board_0.data")
-
-"""
-n_clusters : int, optional, default: 8
-    The number of clusters to form as well as the number of
-    centroids to generate.
-
-init : {'k-means++', 'random' or an ndarray}
-    Method for initialization, defaults to 'k-means++':
-
-    'k-means++' : selects initial cluster centers for k-mean
-    clustering in a smart way to speed up convergence. See section
-    Notes in k_init for more details.
-
-    'random': choose k observations (rows) at random from data for
-    the initial centroids.
-
-    If an ndarray is passed, it should be of shape (n_clusters, n_features)
-    and gives the initial centers.
-
-n_init : int, default: 10
-    Number of time the k-means algorithm will be run with different
-    centroid seeds. The final results will be the best output of
-    n_init consecutive runs in terms of inertia.
-    
-random_state : int, RandomState instance or None, optional, default: None
-    If int, random_state is the seed used by the random number generator;
-    If RandomState instance, random_state is the random number generator;
-    If None, the random number generator is the RandomState instance used
-    by `np.random`.
-"""
-
-# model = KMeans(n_clusters=3, random_state=1, n_init=1, init='random').fit(X.data, X.target)
-model = MiniBatchKMeans(init='k-means++', n_clusters=3, batch_size=3,
-                        n_init=10, max_no_improvement=10, verbose=0,
-                        random_state=0).fit(X.data, X.target)
-
-Y = model.predict(X.data)
-
-print(confusion_matrix(X.target, Y, labels=[0, 1, 2]))
-print(accuracy_score(X.target, Y))
-
-# homogeneity: each cluster contains only members of a single class.
-print(homogeneity_score(X.target, Y))
-
-# completeness: all members of a given class are assigned to the same cluster.
-print(completeness_score(X.target, Y))
-
-# cluster's centers
-# print(kmeans.cluster_centers_)
-
-# X_train, X_test, y_train, y_test = train_test_split(X.data, X.target, test_size=0.1, random_state=42)
-# print(X_train, X_test, y_train, y_test)
-
-color = ["g", "r", "b"]
-
-fig = figure()
-ax = fig.gca(projection='3d')
-
-for i in range(X.data.shape[0]):
-    ax.scatter(X.data[i][0], X.data[i][1], X.data[i][2], c=color[model.labels_[i]])
-
-ax.scatter(model.cluster_centers_[:, 0], model.cluster_centers_[:, 1], model.cluster_centers_[:, 2],
-           marker="x", s=150, linewidths=5, zorder=100, c="black")
-plt.show()

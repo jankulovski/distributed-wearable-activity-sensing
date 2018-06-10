@@ -36,6 +36,7 @@ const uint8_t sda_pin = 12;
 const uint8_t mpu9250_adress = 0x68;
 
 ip_addr_t dstaddr;
+u16_t dstport = 8888;
 
 struct udp_pcb *nefastor_pcb;
 
@@ -126,7 +127,7 @@ void mpu9250_read_acc(void *pvParameters){
         go = pbuf_alloc(PBUF_TRANSPORT, 1, PBUF_REF);
         go->payload = &accelerations;
         go->len = go->tot_len = sizeof(accelerations);
-        udp_sendto(nefastor_pcb, go, &dstaddr, 8888);
+        udp_sendto(nefastor_pcb, go, &dstaddr, dstport);
         pbuf_free(go);
 
         // zero-reset accelerations
@@ -224,5 +225,5 @@ void user_init(void)
 
     // Listening for UDP
     nefastor_pcb = udp_new();
-    udp_bind(nefastor_pcb, IP_ADDR_ANY, 8888);
+    udp_bind(nefastor_pcb, IP_ADDR_ANY, dstport);
 }
