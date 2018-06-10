@@ -1,1 +1,1 @@
-# fri-computer-systems
+# Distributed Wearable Activity Sensing
